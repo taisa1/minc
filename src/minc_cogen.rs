@@ -28,7 +28,7 @@ pub fn ast_to_asm_def(def: minc_ast::Def) -> String {
     let mut asm = String::new();
     match def {
         minc_ast::Def::Fun(ref name, ref params, ref ret_type, ref body) => {
-            let mut env: HashMap<String, usize> = HashMap::new();
+            let mut env: HashMap<String, String> = HashMap::new();
             let mut v: usize = 0;
             asm.push_str(&gen_prologue(&def, &mut env, &mut v).body);
             asm.push_str(&ast_to_asm_stmt(body, &mut env, v).body);
@@ -40,7 +40,7 @@ pub fn ast_to_asm_def(def: minc_ast::Def) -> String {
 
 pub fn gen_prologue(
     def: &minc_ast::Def,
-    env: &mut HashMap<String, usize>,
+    env: &mut HashMap<String, String>,
     v: &mut usize,
 ) -> Assembly {
     //grow the stack
@@ -49,7 +49,23 @@ pub fn gen_prologue(
     };
     match def {
         minc_ast::Def::Fun(ref name, ref params, ref ret_type, ref body) => {
-            (*env, *v) = env_extend(params, v, env);
+            let mut i: usize = 0;
+            for param in params {
+                let loc = match i {
+                    0 => format!("%rdi"),
+                    1 => format!("%rsi"),
+                    2 => format!("%rdx"),
+                    3 => format!("%rcx"),
+                    4 => format!("%r8"),
+                    5 => format!("%r9"),
+                    _ => format!("{}(%rsp)", (i - 5) * 8),
+                };
+                env_add(param.name.clone(), loc, env);
+                if i > 5 {
+                    *v = (i - 4) * 8;
+                }
+                i += 1;
+            }
         }
     }
     res
@@ -68,7 +84,7 @@ pub fn gen_epilogue(def: &minc_ast::Def) -> Assembly {
 
 pub fn ast_to_asm_stmt(
     stmt: &minc_ast::Stmt,
-    env: &mut HashMap<String, usize>,
+    env: &mut HashMap<String, String>,
     v: usize,
 ) -> Assembly {
     let mut res: Assembly = Assembly {
@@ -175,7 +191,7 @@ pub fn ast_to_asm_stmt(
 //returns (op,insns)
 pub fn ast_to_asm_expr(
     expr: &minc_ast::Expr,
-    env: &mut HashMap<String, usize>,
+    env: &mut HashMap<String, String>,
     v: usize,
 ) -> (String, Assembly) {
     let mut res_op = String::new();
@@ -187,15 +203,13 @@ pub fn ast_to_asm_expr(
             res_op = format!("${}", val);
         }
         minc_ast::Expr::Id(name) => {
-            res_op = format!("{}(%rsp)", &env_lookup(name, env));
+            res_op = format!("{}", &env_lookup(name, env));
         }
         minc_ast::Expr::Op(op, args) => {
-            println!("{}", op);
+            println!("{} {}", op, v);
             let (op1, insns1) = ast_to_asm_expr(&args[1], env, v);
             let (op0, insns0) = ast_to_asm_expr(&args[0], env, v + 8);
-            let new_env = env_add("m".to_string(), v, env);
             let m1 = v.to_string() + "(%rsp)";
-            let new_v = v + 8;
             res_insns.push_asm(insns1);
             res_insns.push_line(format!("movq {}, {}", op1, m1).as_str());
             /*
@@ -234,11 +248,6 @@ pub fn ast_to_asm_expr(
                     res_op = op0;
                 }
                 "<" => {
-                    let (op1, insns1) = ast_to_asm_expr(&args[1], env, v);
-                    let (op0, insns0) = ast_to_asm_expr(&args[0], env, v + 8);
-                    let new_env = env_add("m".to_string(), v, env);
-                    let m0 = v.to_string() + "(%rsp)";
-                    let m1 = (v + 8).to_string() + "(%rsp)";
                     /*
                     insns1
                     movq op1,m1     m1 <- op1
@@ -266,29 +275,26 @@ pub fn ast_to_asm_expr(
     (res_op, res_insns)
 }
 
-pub fn env_lookup(name: &String, env: &mut HashMap<String, usize>) -> usize {
-    env[name]
+pub fn env_lookup(name: &String, env: &mut HashMap<String, String>) -> String {
+    if !env.contains_key(name) {
+        panic!("key not found: {}", name);
+    }
+    env[name].clone()
 }
 
-pub fn env_add(
-    name: String,
-    loc: usize,
-    env: &mut HashMap<String, usize>,
-) -> HashMap<String, usize> {
-    let mut new_env = env.clone();
-    new_env.insert(name, loc);
-    new_env
+pub fn env_add(name: String, loc: String, env: &mut HashMap<String, String>) {
+    env.insert(name, loc);
 }
 
 pub fn env_extend(
     decls: &Vec<minc_ast::Decl>,
     loc: &usize,
-    env: &HashMap<String, usize>,
-) -> (HashMap<String, usize>, usize) {
+    env: &HashMap<String, String>,
+) -> (HashMap<String, String>, usize) {
     let mut new_env = env.clone();
     let mut new_v: usize = loc.clone();
     for decl in decls {
-        new_env = env_add(decl.name.clone(), new_v, &mut new_env);
+        env_add(decl.name.clone(), format!("{}(%rsp)", new_v), &mut new_env);
         new_v += 8;
     }
     (new_env, new_v)
