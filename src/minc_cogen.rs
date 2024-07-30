@@ -29,7 +29,7 @@ pub fn ast_to_asm_def(def: minc_ast::Def) -> String {
     match def {
         minc_ast::Def::Fun(ref name, ref params, ref ret_type, ref body) => {
             let mut env: HashMap<String, String> = HashMap::new();
-            let mut v: usize = 0;
+            let mut v: usize = 8;
             asm.push_str(&gen_prologue(&def, &mut env, &mut v).body);
             asm.push_str(&ast_to_asm_stmt(body, &mut env, v).body);
             asm.push_str(&gen_epilogue(&def).body);
@@ -43,12 +43,20 @@ pub fn gen_prologue(
     env: &mut HashMap<String, String>,
     v: &mut usize,
 ) -> Assembly {
-    //grow the stack
+    //TODO: grow the stack
     let mut res: Assembly = Assembly {
         body: String::new(),
     };
     match def {
         minc_ast::Def::Fun(ref name, ref params, ref ret_type, ref body) => {
+            res.push_line(format!(".file\t\"{}.c\"", name).as_str());
+            res.push_line(format!(".text").as_str());
+            res.push_line(format!(".p2align 4,,15").as_str());
+            res.push_line(format!(".globl {}", name).as_str());
+            res.push_line(format!(".type {}, @function", name).as_str());
+            res.push_line(format!("{}:", name).as_str());
+            res.push_line(format!("LFB0:").as_str());
+            res.push_line(format!(".cfi_startproc").as_str());
             let mut i: usize = 0;
             for param in params {
                 let loc = match i {
@@ -72,12 +80,20 @@ pub fn gen_prologue(
 }
 
 pub fn gen_epilogue(def: &minc_ast::Def) -> Assembly {
-    //shrink the stack, ret
+    //TODO: shrink the stack, ret
     let mut res: Assembly = Assembly {
         body: String::new(),
     };
     match def {
-        minc_ast::Def::Fun(ref name, ref params, ref ret_type, ref body) => {}
+        minc_ast::Def::Fun(ref name, ref params, ref ret_type, ref body) => {
+            res.push_line(format!(".cfi_endproc").as_str());
+            res.push_line(format!(".LFE0:").as_str());
+            res.push_line(format!(".size {}, .-{}", name, name).as_str());
+            res.push_line(
+                format!(".ident \"GCC: (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0\"").as_str(),
+            );
+            res.push_line(format!(".section	.note.GNU-stack,\"\",@progbits").as_str());
+        }
     }
     res
 }
@@ -93,11 +109,13 @@ pub fn ast_to_asm_stmt(
     match stmt {
         minc_ast::Stmt::Empty => {}
         minc_ast::Stmt::Continue => {
+            //TODO
             /*
             jmp Lc
             */
         }
         minc_ast::Stmt::Break => {
+            //TODO
             /*
             jmp Lb
              */
@@ -210,6 +228,7 @@ pub fn ast_to_asm_expr(
             let (op1, insns1) = ast_to_asm_expr(&args[1], env, v);
             let (op0, insns0) = ast_to_asm_expr(&args[0], env, v + 8);
             let m1 = v.to_string() + "(%rsp)";
+            let m0 = (v + 8).to_string() + "(%rsp)";
             res_insns.push_asm(insns1);
             res_insns.push_line(format!("movq {}, {}", op1, m1).as_str());
             /*
@@ -220,44 +239,70 @@ pub fn ast_to_asm_expr(
             これにより>=rsp+v+8に入る
             */
             match op.as_str() {
-                "+" => {
+                "+" | "-" | "*" | "/" | "=" => {
                     res_insns.push_asm(insns0);
-                    res_insns.push_line(format!("addq {}, {}", m1, op0).as_str());
+                    match op.as_str() {
+                        "+" => {
+                            res_insns.push_line(format!("addq {}, {}", m1, op0).as_str());
+                        }
+                        "-" => {
+                            res_insns.push_line(format!("subq {}, {}", m1, op0).as_str());
+                        }
+                        "*" => {
+                            res_insns.push_line(format!("imulq {}, {}, {}", m1, op0, op0).as_str());
+                        }
+                        "/" => {
+                            res_insns.push_line(format!("movq op0, %rax").as_str());
+                            res_insns.push_line(format!("idivq {}", m1).as_str());
+                            res_insns.push_line(format!("movq %rax, op0").as_str());
+                            // assume op0!=rax
+                        }
+                        "=" => {
+                            res_insns.push_line(format!("movq {}, {}", m1, op0).as_str());
+                        }
+                        _ => {}
+                    }
                     res_op = op0;
                 }
-                "-" => {
-                    res_insns.push_asm(insns0);
-                    res_insns.push_line(format!("subq {}, {}", m1, op0).as_str());
-                    res_op = op0;
-                }
-                "*" => {
-                    res_insns.push_asm(insns0);
-                    res_insns.push_line(format!("imulq {}, {}, {}", m1, op0, op0).as_str());
-                    res_op = op0;
-                }
-                "/" => {
-                    res_insns.push_asm(insns0);
-                    res_insns.push_line(format!("movq op0, %rax").as_str());
-                    res_insns.push_line(format!("idivq {}", m1).as_str());
-                    res_insns.push_line(format!("movq %rax, op0").as_str()); // assume op0!=rax
-                    res_op = op0;
-                }
-                "=" => {
-                    res_insns.push_asm(insns0);
-                    res_insns.push_line(format!("movq {}, {}", m1, op0).as_str());
-                    res_op = op0;
-                }
-                "<" => {
+                "<" | ">" | "==" | "<=" | ">=" | "!=" => {
                     /*
+                    ex. ">"
                     insns1
                     movq op1,m1     m1 <- op1
                     insns0
                     movq op0,m0     m0 <- op0
                     movq $0,%rax    rax <- 0
                     movq m0,op0     op0 <- m0
-                    cmpq m1,op0     m1>op0?
-                    setl rax        rax <- m1>op0
+                    cmpq m1,op0     set flag
+                    setl rax        rax <- m1<op0
                      */
+                    res_insns.push_asm(insns0);
+                    res_insns.push_line(format!("movq op0, {}", m0).as_str());
+                    res_insns.push_line(format!("movq $0, %rax").as_str());
+                    res_insns.push_line(format!("movq {}, {}", m0, op0).as_str());
+                    res_insns.push_line(format!("cmpq {}, {}", m1, op0).as_str());
+                    match op.as_str() {
+                        "<" => {
+                            res_insns.push_line(format!("setl %rax").as_str());
+                        }
+                        ">" => {
+                            res_insns.push_line(format!("setr %rax").as_str());
+                        }
+                        "==" => {
+                            res_insns.push_line(format!("sete %rax").as_str());
+                        }
+                        "<=" => {
+                            res_insns.push_line(format!("setle %rax").as_str());
+                        }
+                        ">=" => {
+                            res_insns.push_line(format!("setre %rax").as_str());
+                        }
+                        "!=" => {
+                            res_insns.push_line(format!("setne %rax").as_str());
+                        }
+                        _ => {}
+                    }
+                    res_op = format!("%rax");
                 }
                 _ => {}
             }
