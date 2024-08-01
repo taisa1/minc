@@ -9,7 +9,12 @@ impl Assembly {
     fn push_asm(&mut self, asm: Assembly) {
         self.body.push_str(asm.body.as_str());
     }
+    fn push_label(&mut self, line: &str) {
+        self.body.push_str(line);
+        self.body.push('\n');
+    }
     fn push_line(&mut self, line: &str) {
+        self.body.push('\t');
         self.body.push_str(line);
         self.body.push('\n');
     }
@@ -19,21 +24,29 @@ impl Assembly {
 pub fn ast_to_asm_program(_program: minc_ast::Program) -> String {
     let mut asm: String = String::new();
     let mut Lnum = 0;
+    let mut fnum = 0;
+    let fall = _program.defs.len();
     for def in _program.defs {
-        asm.push_str(&ast_to_asm_def(def, &mut Lnum));
+        asm.push_str(&ast_to_asm_def(def, &mut Lnum, &mut fnum, fall));
+        fnum += 1;
     }
     asm.to_string()
 }
 
-pub fn ast_to_asm_def(def: minc_ast::Def, Lnum: &mut usize) -> String {
+pub fn ast_to_asm_def(
+    def: minc_ast::Def,
+    Lnum: &mut usize,
+    fnum: &mut usize,
+    fall: usize,
+) -> String {
     let mut asm = String::new();
     match def {
         minc_ast::Def::Fun(ref name, ref params, ref ret_type, ref body) => {
             let mut env: HashMap<String, String> = HashMap::new();
             let mut v: usize = 8;
-            asm.push_str(&gen_prologue(&def, &mut env, &mut v).body);
+            asm.push_str(&gen_prologue(&def, &mut env, &mut v, fnum).body);
             asm.push_str(&ast_to_asm_stmt(body, &mut env, v, Lnum).body);
-            asm.push_str(&gen_epilogue(&def).body);
+            asm.push_str(&gen_epilogue(&def, fnum, fall).body);
         }
     }
     asm
@@ -43,6 +56,7 @@ pub fn gen_prologue(
     def: &minc_ast::Def,
     env: &mut HashMap<String, String>,
     v: &mut usize,
+    fnum: &mut usize,
 ) -> Assembly {
     //TODO: grow the stack
     let mut res: Assembly = Assembly {
@@ -50,13 +64,15 @@ pub fn gen_prologue(
     };
     match def {
         minc_ast::Def::Fun(ref name, ref params, ref ret_type, ref body) => {
-            res.push_line(format!(".file\t\"{}.c\"", name).as_str());
-            res.push_line(format!(".text").as_str());
-            res.push_line(format!(".p2align 4,,15").as_str());
+            // res.push_line(format!(".file\t\"{}.c\"", name).as_str());
+            if *fnum == 0 {
+                res.push_line(format!(".text").as_str());
+                res.push_line(format!(".p2align 4,,15").as_str());
+            }
             res.push_line(format!(".globl {}", name).as_str());
             res.push_line(format!(".type {}, @function", name).as_str());
-            res.push_line(format!("{}:", name).as_str());
-            res.push_line(format!("LFB0:").as_str());
+            res.push_label(format!("{}:", name).as_str());
+            res.push_label(format!("LFB{}:", fnum).as_str());
             res.push_line(format!(".cfi_startproc").as_str());
             let mut i: usize = 0;
             for param in params {
@@ -80,7 +96,7 @@ pub fn gen_prologue(
     res
 }
 
-pub fn gen_epilogue(def: &minc_ast::Def) -> Assembly {
+pub fn gen_epilogue(def: &minc_ast::Def, fnum: &mut usize, fall: usize) -> Assembly {
     //TODO: shrink the stack, ret
     let mut res: Assembly = Assembly {
         body: String::new(),
@@ -88,12 +104,14 @@ pub fn gen_epilogue(def: &minc_ast::Def) -> Assembly {
     match def {
         minc_ast::Def::Fun(ref name, ref params, ref ret_type, ref body) => {
             res.push_line(format!(".cfi_endproc").as_str());
-            res.push_line(format!(".LFE0:").as_str());
+            res.push_label(format!(".LFE{}:", fnum).as_str());
             res.push_line(format!(".size {}, .-{}", name, name).as_str());
-            res.push_line(
-                format!(".ident \"GCC: (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0\"").as_str(),
-            );
-            res.push_line(format!(".section	.note.GNU-stack,\"\",@progbits").as_str());
+            if *fnum + 1 == fall {
+                res.push_line(
+                    format!(".ident \"GCC: (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0\"").as_str(),
+                );
+                res.push_line(format!(".section	.note.GNU-stack,\"\",@progbits").as_str());
+            }
         }
     }
     res
@@ -167,9 +185,9 @@ pub fn ast_to_asm_stmt(
             res.push_line(format!("je L{}", Lnum).as_str()); //TODO:L_X
             res.push_asm(then_insns);
             res.push_line(format!("jmp L{}", *Lnum + 1).as_str());
-            res.push_line(format!("L{}:", Lnum).as_str());
+            res.push_label(format!("L{}:", Lnum).as_str());
             res.push_asm(else_insns);
-            res.push_line(format!("L{}:", *Lnum + 1).as_str());
+            res.push_label(format!("L{}:", *Lnum + 1).as_str());
             *Lnum += 1;
         }
         minc_ast::Stmt::If(cond, then_stmt, None) => {
@@ -187,7 +205,7 @@ pub fn ast_to_asm_stmt(
             res.push_line(format!("cmpq $0, {}", cond_op).as_str());
             res.push_line(format!("je L{}", Lnum).as_str()); //TODO:L_X
             res.push_asm(then_insns);
-            res.push_line(format!("L{}:", Lnum).as_str());
+            res.push_label(format!("L{}:", Lnum).as_str());
         }
         minc_ast::Stmt::While(cond, body) => {
             let (cond_op, cond_insns) = ast_to_asm_expr(&cond, env, v);
@@ -205,9 +223,9 @@ pub fn ast_to_asm_stmt(
             */
             *Lnum += 1;
             res.push_line(format!("jmp Lc{}", Lnum).as_str());
-            res.push_line(format!("Ls{}:", Lnum).as_str());
+            res.push_label(format!("Ls{}:", Lnum).as_str());
             res.push_asm(body_insns);
-            res.push_line(format!("Lc{}:", Lnum).as_str());
+            res.push_label(format!("Lc{}:", Lnum).as_str());
             res.push_asm(cond_insns);
             res.push_line(format!("cmpq $0, {}", cond_op).as_str());
             res.push_line(format!("jne Ls{}", Lnum).as_str());
@@ -379,9 +397,32 @@ pub fn ast_to_asm_expr(
             }
         }
         minc_ast::Expr::Call(fun, args) => {
-            //
-            let (fun_op, _) = ast_to_asm_expr(fun, env, v);
-            res_insns.push_line(format!("call {}", fun_op).as_str());
+            let mut fun_name = String::new();
+            match fun.as_ref() {
+                minc_ast::Expr::Id(name) => {
+                    fun_name = name.clone();
+                }
+                _ => {
+                    assert!(false);
+                }
+            }
+            let mut i = 0;
+            for arg in args {
+                let loc = match i {
+                    0 => format!("%rdi"),
+                    1 => format!("%rsi"),
+                    2 => format!("%rdx"),
+                    3 => format!("%rcx"),
+                    4 => format!("%r8"),
+                    5 => format!("%r9"),
+                    _ => format!("{}(%rsp)", (i - 5) * 8),
+                };
+                let (arg_op, arg_insns) = ast_to_asm_expr(arg, env, v);
+                res_insns.push_asm(arg_insns);
+                res_insns.push_line(format!("movq {}, {}", arg_op, loc).as_str());
+                i += 1;
+            }
+            res_insns.push_line(format!("call {}@PLT", fun_name).as_str());
         }
         minc_ast::Expr::Paren(sub_expr) => {
             // return as it is
