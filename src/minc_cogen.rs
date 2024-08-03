@@ -1,4 +1,5 @@
 use crate::minc_ast;
+use std::cmp::max;
 use std::{collections::HashMap, hash::Hash};
 
 struct Assembly {
@@ -67,14 +68,18 @@ pub fn gen_prologue(
             // res.push_line(format!(".file\t\"{}.c\"", name).as_str());
             if *fnum == 0 {
                 res.push_line(format!(".text").as_str());
-                res.push_line(format!(".p2align 4,,15").as_str());
             }
             res.push_line(format!(".globl {}", name).as_str());
             res.push_line(format!(".type {}, @function", name).as_str());
             res.push_label(format!("{}:", name).as_str());
             res.push_label(format!("LFB{}:", fnum).as_str());
             res.push_line(format!(".cfi_startproc").as_str());
+            res.push_line(format!("endbr64").as_str());
+            res.push_line(format!("pushq %rbp").as_str());
+            res.push_line(format!("movq %rsp, %rbp").as_str());
+            res.push_line(format!("subq $256, %rsp").as_str());
             let mut i: usize = 0;
+            let mut new_reg = 8;
             for param in params {
                 let loc = match i {
                     0 => format!("%rdi"),
@@ -83,14 +88,18 @@ pub fn gen_prologue(
                     3 => format!("%rcx"),
                     4 => format!("%r8"),
                     5 => format!("%r9"),
-                    _ => format!("{}(%rsp)", (i - 5) * 8),
+                    _ => format!("{}(%rbp)", (i - 4) * 8),
                 };
-                env_add(param.name.clone(), loc, env);
-                if i > 5 {
-                    *v = (i - 4) * 8;
+                if i <= 5 {
+                    res.push_line(format!("movq {}, -{}(%rbp)", loc, new_reg).as_str());
+                    env_add(param.name.clone(), format!("-{}(%rbp)", new_reg), env);
+                    new_reg += 8;
+                } else {
+                    env_add(param.name.clone(), loc, env);
                 }
                 i += 1;
             }
+            *v = new_reg;
         }
     }
     res
@@ -149,6 +158,7 @@ pub fn ast_to_asm_stmt(
              */
             res.push_asm(ret_insns);
             res.push_line(format!("movq {}, %rax", ret_op).as_str());
+            res.push_line("leave");
             res.push_line("ret");
         }
         minc_ast::Stmt::Expr(expr) => {
@@ -160,7 +170,6 @@ pub fn ast_to_asm_stmt(
         }
         minc_ast::Stmt::Compound(decls, stmts) => {
             let (mut new_env, new_v) = env_extend(decls, &v, env);
-            println!("{}", new_v);
             for stmt in stmts {
                 res.push_asm(ast_to_asm_stmt(stmt, &mut new_env, new_v, Lnum));
             }
@@ -246,8 +255,8 @@ pub fn ast_to_asm_expr(
     };
     match expr {
         minc_ast::Expr::IntLiteral(val) => {
-            res_insns.push_line(format!("movq ${}, %rax", val).as_str());
-            res_op = format!("%rax");
+            res_insns.push_line(format!("movq ${}, %rcx", val).as_str());
+            res_op = format!("%rcx");
         }
         minc_ast::Expr::Id(name) => {
             res_op = format!("{}", &env_lookup(name, env));
@@ -255,31 +264,36 @@ pub fn ast_to_asm_expr(
         minc_ast::Expr::Op(op, args) => {
             if args.len() == 1 {
                 let (op0, insns0) = ast_to_asm_expr(&args[0], env, v);
-                let m0 = v.to_string() + "(%rsp)";
+                let m0 = format!("-{}(%rbp)", v.to_string());
                 res_insns.push_asm(insns0);
-                res_insns.push_line(format!("movq {}, {}", op0, m0).as_str());
+                if &op0[..1] != "%" {
+                    res_insns.push_line(format!("movq {}, %rcx", op0).as_str());
+                    res_insns.push_line(format!("movq %rcx, {}", m0).as_str());
+                } else {
+                    res_insns.push_line(format!("movq {}, {}", op0, m0).as_str());
+                }
+                res_op = format!("%rcx");
                 match op.as_str() {
-                    "+" => {
-                        res_op = op0;
-                    }
+                    "+" => res_op = op0,
                     "-" => {
-                        res_insns.push_line(format!("movq $0, {}", op0).as_str());
-                        res_insns.push_line(format!("subq {}, {}", m0, op0).as_str());
-                        res_op = op0;
+                        res_insns.push_line(format!("movq $0, %rcx").as_str());
+                        res_insns.push_line(format!("subq {}, %rcx", m0).as_str());
+                        res_op = format!("%rcx");
                     }
                     "!" => {
-                        res_insns.push_line(format!("testq {}, {}", op0, op0).as_str());
+                        res_insns.push_line(format!("movq $0, %rax").as_str());
+                        res_insns.push_line(format!("movq {}, %rcx", op0).as_str());
+                        res_insns.push_line(format!("testq %rcx, %rcx").as_str());
                         res_insns.push_line(format!("sete %al").as_str());
-                        res_insns.push_line(format!("movzbq %al, {}", op0).as_str());
-                        res_op = op0;
+                        res_insns.push_line(format!("movq %rax, %rcx").as_str());
                     }
                     _ => {}
                 }
             } else if args.len() == 2 {
                 let (op1, insns1) = ast_to_asm_expr(&args[1], env, v);
                 let (op0, insns0) = ast_to_asm_expr(&args[0], env, v + 8);
-                let m1 = v.to_string() + "(%rsp)";
-                let m0 = (v + 8).to_string() + "(%rsp)";
+                let m1 = format!("-{}(%rbp)", v.to_string());
+                let m0 = format!("-{}(%rbp)", (v + 8).to_string());
                 res_insns.push_asm(insns1);
                 if &op1[..1] != "%" {
                     //avoid memory load
@@ -300,55 +314,45 @@ pub fn ast_to_asm_expr(
                         res_insns.push_asm(insns0);
                         match op.as_str() {
                             "+" => {
-                                if &op0[..1] == "%" {
-                                    res_insns.push_line(format!("addq {}, {}", m1, op0).as_str());
-                                } else {
-                                    res_insns.push_line(format!("movq {}, %rax", op0).as_str());
-                                    res_insns.push_line(format!("addq {}, %rax", m1).as_str());
-                                    res_insns.push_line(format!("movq %rax, {}", op0).as_str());
-                                }
+                                res_insns.push_line(format!("movq {}, %rcx", op0).as_str());
+                                res_insns.push_line(format!("addq {}, %rcx", m1).as_str());
+                                res_op = format!("%rcx");
                             }
                             "-" => {
-                                if &op0[..1] == "%" {
-                                    res_insns.push_line(format!("subq {}, {}", m1, op0).as_str());
-                                } else {
-                                    res_insns.push_line(format!("movq {}, %rax", op0).as_str());
-                                    res_insns.push_line(format!("subq {}, %rax", m1).as_str());
-                                    res_insns.push_line(format!("movq %rax, {}", op0).as_str());
-                                }
+                                res_insns.push_line(format!("movq {}, %rcx", op0).as_str());
+                                res_insns.push_line(format!("subq {}, %rcx", m1).as_str());
+                                res_op = format!("%rcx");
                             }
                             "*" => {
-                                if &op0[..1] == "%" {
-                                    res_insns.push_line(format!("imulq {}, {}", m1, op0).as_str());
-                                } else {
-                                    res_insns.push_line(format!("movq {}, %rax", op0).as_str());
-                                    res_insns.push_line(format!("imulq {}, %rax", m1).as_str());
-                                    res_insns.push_line(format!("movq %rax, {}", op0).as_str());
-                                }
+                                res_insns.push_line(format!("movq {}, %rcx", op0).as_str());
+                                res_insns.push_line(format!("imulq {}, %rcx", m1).as_str());
+                                res_op = format!("%rcx");
                             }
                             "/" => {
                                 res_insns.push_line(format!("movq {}, %rax", op0).as_str());
                                 res_insns.push_line(format!("cqto").as_str());
                                 res_insns.push_line(format!("idivq {}", m1).as_str());
-                                res_insns.push_line(format!("movq %rax, {}", op0).as_str());
+                                res_insns.push_line(format!("movq %rax, %rcx").as_str());
+                                res_op = format!("%rcx");
                             }
                             "%" => {
                                 res_insns.push_line(format!("movq {}, %rax", op0).as_str());
                                 res_insns.push_line(format!("cqto").as_str());
                                 res_insns.push_line(format!("idivq {}", m1).as_str());
-                                res_insns.push_line(format!("movq %rdx, {}", op0).as_str());
+                                res_insns.push_line(format!("movq %rdx, %rcx").as_str());
+                                res_op = format!("%rcx");
                             }
                             "=" => {
                                 if &op0[..1] == "%" {
                                     res_insns.push_line(format!("movq {}, {}", m1, op0).as_str());
                                 } else {
-                                    res_insns.push_line(format!("movq {}, %rax", m1).as_str());
-                                    res_insns.push_line(format!("movq %rax, {}", op0).as_str());
+                                    res_insns.push_line(format!("movq {}, %rcx", m1).as_str());
+                                    res_insns.push_line(format!("movq %rcx, {}", op0).as_str());
                                 }
+                                res_op = op0;
                             }
                             _ => {}
                         }
-                        res_op = op0;
                     }
                     "<" | ">" | "==" | "<=" | ">=" | "!=" => {
                         /*
@@ -363,10 +367,16 @@ pub fn ast_to_asm_expr(
                         setl rax        rax <- m1<op0
                          */
                         res_insns.push_asm(insns0);
-                        res_insns.push_line(format!("movq {}, {}", op0, m0).as_str());
-                        res_insns.push_line(format!("movq $0, %rax").as_str());
-                        res_insns.push_line(format!("movq {}, {}", m0, op0).as_str());
-                        res_insns.push_line(format!("cmpq {}, {}", m1, op0).as_str());
+                        if &op0[0..1] != "%" {
+                            res_insns.push_line(format!("movq {}, %rcx", op0).as_str());
+                            res_insns.push_line(format!("movq $0, %rax").as_str());
+                            res_insns.push_line(format!("cmpq {}, %rcx", m1).as_str());
+                        } else {
+                            res_insns.push_line(format!("movq {}, {}", op0, m0).as_str());
+                            res_insns.push_line(format!("movq $0, %rax").as_str());
+                            res_insns.push_line(format!("movq {}, {}", m0, op0).as_str());
+                            res_insns.push_line(format!("cmpq {}, {}", m1, op0).as_str());
+                        }
                         match op.as_str() {
                             "<" => {
                                 res_insns.push_line(format!("setl %al").as_str());
@@ -390,7 +400,9 @@ pub fn ast_to_asm_expr(
                             }
                             _ => {}
                         }
-                        res_op = format!("%rax");
+                        res_insns.push_line(format!("movq $0, %rcx").as_str());
+                        res_insns.push_line(format!("movq %rax, %rcx").as_str());
+                        res_op = format!("%rcx");
                     }
                     _ => {}
                 }
@@ -406,8 +418,12 @@ pub fn ast_to_asm_expr(
                     assert!(false);
                 }
             }
-            let mut i = 0;
-            for arg in args {
+            let mut i = args.len();
+            for arg in args.iter().rev() {
+                i -= 1;
+                if i == 3 {
+                    continue;
+                }
                 let loc = match i {
                     0 => format!("%rdi"),
                     1 => format!("%rsi"),
@@ -419,10 +435,20 @@ pub fn ast_to_asm_expr(
                 };
                 let (arg_op, arg_insns) = ast_to_asm_expr(arg, env, v);
                 res_insns.push_asm(arg_insns);
-                res_insns.push_line(format!("movq {}, {}", arg_op, loc).as_str());
-                i += 1;
+                if i >= 6 {
+                    res_insns.push_line(format!("pushq {}", arg_op).as_str())
+                } else {
+                    res_insns.push_line(format!("movq {}, {}", arg_op, loc).as_str());
+                }
+            }
+            if args.len() > 3 {
+                let (arg_op, arg_insns) = ast_to_asm_expr(&args[3], env, v);
+                res_insns.push_asm(arg_insns);
+                res_insns.push_line(format!("movq {}, %rcx", arg_op).as_str());
             }
             res_insns.push_line(format!("call {}@PLT", fun_name).as_str());
+            res_insns.push_line(format!("movq %rax, %rcx").as_str());
+            res_op = format!("%rcx");
         }
         minc_ast::Expr::Paren(sub_expr) => {
             // return as it is
@@ -451,7 +477,7 @@ pub fn env_extend(
     let mut new_env = env.clone();
     let mut new_v: usize = loc.clone();
     for decl in decls {
-        env_add(decl.name.clone(), format!("{}(%rsp)", new_v), &mut new_env);
+        env_add(decl.name.clone(), format!("-{}(%rbp)", new_v), &mut new_env);
         new_v += 8;
     }
     (new_env, new_v)
