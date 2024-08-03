@@ -3,3 +3,9 @@ Simple C compiler by Rust, developed for the assignment of "programming language
 
 I implemented only src/minc_cogen.rs by myself. Other code was provided in the class.
 
+It can be tested as below:
+
+```
+cd test/
+make
+```
