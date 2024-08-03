@@ -1,8 +1,8 @@
 use crate::minc_ast;
 use std::cmp::max;
-use std::{collections::HashMap, hash::Hash};
+use std::collections::HashMap;
 
-struct Assembly {
+pub struct Assembly {
     body: String,
 }
 
@@ -24,11 +24,11 @@ impl Assembly {
 #[allow(unreachable_code, unused_variables)]
 pub fn ast_to_asm_program(_program: minc_ast::Program) -> String {
     let mut asm: String = String::new();
-    let mut Lnum = 0;
-    let mut fnum = 0;
-    let fall = _program.defs.len();
+    let mut lnum = 0; // label index, incremented as label generated
+    let mut fnum = 0; // function index, incremented as function compiled
+    let fall = _program.defs.len(); // the number of funcions
     for def in _program.defs {
-        asm.push_str(&ast_to_asm_def(def, &mut Lnum, &mut fnum, fall));
+        asm.push_str(&ast_to_asm_def(def, &mut lnum, &mut fnum, fall));
         fnum += 1;
     }
     asm.to_string()
@@ -36,19 +36,21 @@ pub fn ast_to_asm_program(_program: minc_ast::Program) -> String {
 
 pub fn ast_to_asm_def(
     def: minc_ast::Def,
-    Lnum: &mut usize,
+    lnum: &mut usize,
     fnum: &mut usize,
     fall: usize,
 ) -> String {
     let mut asm = String::new();
     match def {
-        minc_ast::Def::Fun(ref name, ref params, ref ret_type, ref body) => {
+        minc_ast::Def::Fun(ref _name, ref _params, ref _ret_type, ref body) => {
             let mut env: HashMap<String, String> = HashMap::new();
             let mut v: usize = 8;
-            let mut vmax: usize = 8;
-            let mut prologue = String::new();
-            prologue.push_str(&gen_prologue(&def, &mut env, &mut v, vmax, fnum).body);
-            let stmt = &ast_to_asm_stmt(body, &mut env, v, &mut vmax, Lnum).body;
+            let prologue = &gen_prologue(&def, &mut env, &mut v, fnum).body;
+
+            let mut vmax: usize = v; // maximum stack usage
+            let stmt = &ast_to_asm_stmt(body, &mut env, v, &mut vmax, lnum).body;
+
+            // adjust stack size according to actual usage
             let mut new_prologue = String::new();
             for line in prologue.lines() {
                 if line.contains("subq $256, %rsp") {
@@ -57,26 +59,27 @@ pub fn ast_to_asm_def(
                     new_prologue.push_str(format!("{}\n", line).as_str());
                 }
             }
+
             asm.push_str(&new_prologue);
-            asm.push_str(stmt);
+            asm.push_str(&stmt);
             asm.push_str(&gen_epilogue(&def, fnum, fall).body);
         }
     }
     asm
 }
 
+// generate prologue of the function
 pub fn gen_prologue(
     def: &minc_ast::Def,
     env: &mut HashMap<String, String>,
     v: &mut usize,
-    vmax: usize,
     fnum: &mut usize,
 ) -> Assembly {
     let mut res: Assembly = Assembly {
         body: String::new(),
     };
     match def {
-        minc_ast::Def::Fun(ref name, ref params, ref ret_type, ref body) => {
+        minc_ast::Def::Fun(ref name, ref params, ref _ret_type, ref _body) => {
             // res.push_line(format!(".file\t\"{}.c\"", name).as_str());
             if *fnum == 0 {
                 res.push_line(format!(".text").as_str());
@@ -87,9 +90,11 @@ pub fn gen_prologue(
             res.push_label(format!("LFB{}:", fnum).as_str());
             res.push_line(format!(".cfi_startproc").as_str());
             res.push_line(format!("endbr64").as_str());
+
             res.push_line(format!("pushq %rbp").as_str());
             res.push_line(format!("movq %rsp, %rbp").as_str());
-            res.push_line(format!("subq $256, %rsp").as_str());
+            res.push_line(format!("subq $256, %rsp").as_str()); // expand stack by 256 (temporary size, modified later)
+
             let mut i: usize = 0;
             let mut new_reg = 8;
             for param in params {
@@ -103,6 +108,7 @@ pub fn gen_prologue(
                     _ => format!("{}(%rbp)", (i - 4) * 8),
                 };
                 if i <= 5 {
+                    // evacuate param to stack area
                     res.push_line(format!("movq {}, -{}(%rbp)", loc, new_reg).as_str());
                     env_add(param.name.clone(), format!("-{}(%rbp)", new_reg), env);
                     new_reg += 8;
@@ -117,15 +123,18 @@ pub fn gen_prologue(
     res
 }
 
+// generate epilogue of the function
 pub fn gen_epilogue(def: &minc_ast::Def, fnum: &mut usize, fall: usize) -> Assembly {
     let mut res: Assembly = Assembly {
         body: String::new(),
     };
     match def {
-        minc_ast::Def::Fun(ref name, ref params, ref ret_type, ref body) => {
+        minc_ast::Def::Fun(ref name, ref _params, ref _ret_type, ref _body) => {
             res.push_line(format!(".cfi_endproc").as_str());
             res.push_label(format!(".LFE{}:", fnum).as_str());
             res.push_line(format!(".size {}, .-{}", name, name).as_str());
+
+            // for the last function
             if *fnum + 1 == fall {
                 res.push_line(
                     format!(".ident \"GCC: (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0\"").as_str(),
@@ -142,7 +151,7 @@ pub fn ast_to_asm_stmt(
     env: &mut HashMap<String, String>,
     v: usize,
     vmax: &mut usize,
-    Lnum: &mut usize,
+    lnum: &mut usize, // the index of next label
 ) -> Assembly {
     let mut res: Assembly = Assembly {
         body: String::new(),
@@ -181,16 +190,17 @@ pub fn ast_to_asm_stmt(
             res.push_asm(expr_insns);
         }
         minc_ast::Stmt::Compound(decls, stmts) => {
+            // update env
             let (mut new_env, new_v) = env_extend(decls, &v, env);
             *vmax = max(*vmax, new_v);
             for stmt in stmts {
-                res.push_asm(ast_to_asm_stmt(stmt, &mut new_env, new_v, vmax, Lnum));
+                res.push_asm(ast_to_asm_stmt(stmt, &mut new_env, new_v, vmax, lnum));
             }
         }
         minc_ast::Stmt::If(cond, then_stmt, Some(else_stmt)) => {
             let (cond_op, cond_insns) = ast_to_asm_expr(&cond, env, v, vmax);
-            let then_insns = ast_to_asm_stmt(then_stmt, env, v, vmax, Lnum);
-            let else_insns = ast_to_asm_stmt(else_stmt, env, v, vmax, Lnum);
+            let then_insns = ast_to_asm_stmt(then_stmt, env, v, vmax, lnum);
+            let else_insns = ast_to_asm_stmt(else_stmt, env, v, vmax, lnum);
             /*
                 <cond_insns>
                 cmpq $0, cond_op
@@ -201,20 +211,20 @@ pub fn ast_to_asm_stmt(
                 <else_stmt>
             Le:
              */
-            *Lnum += 1;
+            *lnum += 1;
             res.push_asm(cond_insns);
             res.push_line(format!("cmpq $0, {}", cond_op).as_str());
-            res.push_line(format!("je L{}", Lnum).as_str()); //TODO:L_X
+            res.push_line(format!("je L{}", lnum).as_str());
             res.push_asm(then_insns);
-            res.push_line(format!("jmp L{}", *Lnum + 1).as_str());
-            res.push_label(format!("L{}:", Lnum).as_str());
+            res.push_line(format!("jmp L{}", *lnum + 1).as_str());
+            res.push_label(format!("L{}:", lnum).as_str());
             res.push_asm(else_insns);
-            res.push_label(format!("L{}:", *Lnum + 1).as_str());
-            *Lnum += 1;
+            res.push_label(format!("L{}:", *lnum + 1).as_str());
+            *lnum += 1;
         }
         minc_ast::Stmt::If(cond, then_stmt, None) => {
             let (cond_op, cond_insns) = ast_to_asm_expr(&cond, env, v, vmax);
-            let then_insns = ast_to_asm_stmt(then_stmt, env, v, vmax, Lnum);
+            let then_insns = ast_to_asm_stmt(then_stmt, env, v, vmax, lnum);
             /*
                 <cond_insns>
                 cmpq $0, cond_op
@@ -222,16 +232,16 @@ pub fn ast_to_asm_stmt(
                 <then_insns>
             L:
              */
-            *Lnum += 1;
+            *lnum += 1;
             res.push_asm(cond_insns);
             res.push_line(format!("cmpq $0, {}", cond_op).as_str());
-            res.push_line(format!("je L{}", Lnum).as_str()); //TODO:L_X
+            res.push_line(format!("je L{}", lnum).as_str());
             res.push_asm(then_insns);
-            res.push_label(format!("L{}:", Lnum).as_str());
+            res.push_label(format!("L{}:", lnum).as_str());
         }
         minc_ast::Stmt::While(cond, body) => {
             let (cond_op, cond_insns) = ast_to_asm_expr(&cond, env, v, vmax);
-            let body_insns = ast_to_asm_stmt(body, env, v, vmax, Lnum);
+            let body_insns = ast_to_asm_stmt(body, env, v, vmax, lnum);
             /*
             jmp Lc
             Ls:
@@ -243,33 +253,35 @@ pub fn ast_to_asm_stmt(
             Lb:
                 nop
             */
-            *Lnum += 1;
-            res.push_line(format!("jmp Lc{}", Lnum).as_str());
-            res.push_label(format!("Ls{}:", Lnum).as_str());
+            *lnum += 1;
+            res.push_line(format!("jmp Lc{}", lnum).as_str());
+            res.push_label(format!("Ls{}:", lnum).as_str());
             res.push_asm(body_insns);
-            res.push_label(format!("Lc{}:", Lnum).as_str());
+            res.push_label(format!("Lc{}:", lnum).as_str());
             res.push_asm(cond_insns);
             res.push_line(format!("cmpq $0, {}", cond_op).as_str());
-            res.push_line(format!("jne Ls{}", Lnum).as_str());
+            res.push_line(format!("jne Ls{}", lnum).as_str());
         }
     }
     res
 }
 
-//returns (op,insns)
+// returns (a register to which the result saved, instructions for calculation)
 pub fn ast_to_asm_expr(
     expr: &minc_ast::Expr,
     env: &mut HashMap<String, String>,
     v: usize,
     vmax: &mut usize,
 ) -> (String, Assembly) {
-    let mut res_op = String::new();
+    let mut res_op = String::new(); // a register to which the result saved
     let mut res_insns = Assembly {
+        // instructions for calculation
         body: String::new(),
     };
     *vmax = max(*vmax, v);
     match expr {
         minc_ast::Expr::IntLiteral(val) => {
+            // use %rcx for storing result
             res_insns.push_line(format!("movq ${}, %rcx", val).as_str());
             res_op = format!("%rcx");
         }
@@ -279,8 +291,10 @@ pub fn ast_to_asm_expr(
         minc_ast::Expr::Op(op, args) => {
             if args.len() == 1 {
                 let (op0, insns0) = ast_to_asm_expr(&args[0], env, v, vmax);
-                let m0 = format!("-{}(%rbp)", v.to_string());
+                let m0 = format!("-{}(%rbp)", v.to_string()); // to evacuate register value
                 res_insns.push_asm(insns0);
+
+                // avoid "too many memory references" error
                 if &op0[..1] != "%" {
                     res_insns.push_line(format!("movq {}, %rcx", op0).as_str());
                     res_insns.push_line(format!("movq %rcx, {}", m0).as_str());
@@ -288,6 +302,7 @@ pub fn ast_to_asm_expr(
                     res_insns.push_line(format!("movq {}, {}", op0, m0).as_str());
                 }
                 res_op = format!("%rcx");
+
                 match op.as_str() {
                     "+" => res_op = op0,
                     "-" => {
@@ -305,6 +320,14 @@ pub fn ast_to_asm_expr(
                     _ => {}
                 }
             } else if args.len() == 2 {
+                /*
+                ex. "+"
+                    insns1
+                    movq op1, m1    m1 <- op1
+                    insns0
+                    movq op0, %rcx  %rcx <- op0
+                    addq m, %rcx    %rcx += m1 (= op1)
+                */
                 let (op1, insns1) = ast_to_asm_expr(&args[1], env, v, vmax);
                 let (op0, insns0) = ast_to_asm_expr(&args[0], env, v + 8, vmax);
                 let m1 = format!("-{}(%rbp)", v.to_string());
@@ -317,16 +340,10 @@ pub fn ast_to_asm_expr(
                 } else {
                     res_insns.push_line(format!("movq {}, {}", op1, m1).as_str());
                 }
-                /*
-                insns1
-                movq op1, m    m <- op1
-                insns0
-                addq m, op0    op0 = op0 + m
-                これにより>=rsp+v+8に入る
-                */
                 match op.as_str() {
                     "+" | "-" | "*" | "/" | "%" | "=" => {
                         res_insns.push_asm(insns0);
+                        // res_op is %rcx except "="
                         match op.as_str() {
                             "+" => {
                                 res_insns.push_line(format!("movq {}, %rcx", op0).as_str());
@@ -358,6 +375,7 @@ pub fn ast_to_asm_expr(
                                 res_op = format!("%rcx");
                             }
                             "=" => {
+                                // avoid "too many memory references" error
                                 if &op0[..1] == "%" {
                                     res_insns.push_line(format!("movq {}, {}", m1, op0).as_str());
                                 } else {
@@ -372,16 +390,18 @@ pub fn ast_to_asm_expr(
                     "<" | ">" | "==" | "<=" | ">=" | "!=" => {
                         /*
                         ex. ">"
-                        insns1
-                        movq op1,m1     m1 <- op1
-                        insns0
-                        movq op0,m0     m0 <- op0
-                        movq $0,%rax    rax <- 0
-                        movq m0,op0     op0 <- m0
-                        cmpq m1,op0     set flag
-                        setl rax        rax <- m1<op0
+                            insns1
+                            movq op1, m1     m1 <- op1
+                            insns0
+                            movq op0, m0     m0 <- op0
+                            movq $0, %rax    rax <- 0
+                            movq m0, op0     op0 <- m0
+                            cmpq m1, op0     set flag
+                            setl rax        rax <- m1<op0
                          */
                         res_insns.push_asm(insns0);
+
+                        // avoid "too many memory references" error
                         if &op0[0..1] != "%" {
                             res_insns.push_line(format!("movq {}, %rcx", op0).as_str());
                             res_insns.push_line(format!("movq $0, %rax").as_str());
@@ -392,6 +412,7 @@ pub fn ast_to_asm_expr(
                             res_insns.push_line(format!("movq {}, {}", m0, op0).as_str());
                             res_insns.push_line(format!("cmpq {}, {}", m1, op0).as_str());
                         }
+
                         match op.as_str() {
                             "<" => {
                                 res_insns.push_line(format!("setl %al").as_str());
@@ -437,6 +458,7 @@ pub fn ast_to_asm_expr(
             for arg in args.iter().rev() {
                 i -= 1;
                 if i == 3 {
+                    // this compiler uses %rcx for saving result of calculation, so cannot move arg[3] to %rcx until just before calling
                     continue;
                 }
                 let loc = match i {
@@ -457,6 +479,7 @@ pub fn ast_to_asm_expr(
                 }
             }
             if args.len() > 3 {
+                // move arg[3] to %rcx
                 let (arg_op, arg_insns) = ast_to_asm_expr(&args[3], env, v, vmax);
                 res_insns.push_asm(arg_insns);
                 res_insns.push_line(format!("movq {}, %rcx", arg_op).as_str());
@@ -473,6 +496,8 @@ pub fn ast_to_asm_expr(
     (res_op, res_insns)
 }
 
+// returns location of variable "name" in env
+// env is implemented as HashMap
 pub fn env_lookup(name: &String, env: &mut HashMap<String, String>) -> String {
     if !env.contains_key(name) {
         panic!("key not found: {}", name);
@@ -480,10 +505,13 @@ pub fn env_lookup(name: &String, env: &mut HashMap<String, String>) -> String {
     env[name].clone()
 }
 
+// add a variable(name, loc) to env
 pub fn env_add(name: String, loc: String, env: &mut HashMap<String, String>) {
     env.insert(name, loc);
 }
 
+// returns new (env, v)
+// add variables which declared in decls to env
 pub fn env_extend(
     decls: &Vec<minc_ast::Decl>,
     loc: &usize,
